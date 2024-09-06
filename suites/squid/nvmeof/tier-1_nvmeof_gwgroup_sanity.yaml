@@ -221,9 +221,9 @@ tests:
         run_io:
           - node: node6
             io_type: write
-      desc: Configure 4 GW groups having 4 GW nodes with 2 subsystems 
+      desc: Configure 4 GW groups having 4 GW nodes with 2 subsystems
       destroy-cluster: false
       module: test_nvmeof_gwgroup_sanity.py
-      name: Configure 4 GW groups having 4 GW nodes with 2 subsystems 
-      polarion-id: 
+      name: Configure 4 GW groups having 4 GW nodes with 2 subsystems
+      polarion-id: CEPH-83595697
 

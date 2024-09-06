@@ -1,18 +1,16 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-import time
+
 from ceph.ceph import Ceph
 from ceph.nvmegw_cli import NVMeGWCLI
 from ceph.nvmeof.initiator import Initiator
 from ceph.parallel import parallel
 from ceph.utils import get_node_by_id
-from tests.nvmeof.test_ceph_nvmeof_gateway import teardown
 from tests.nvmeof.workflows.ha import HighAvailability
 from tests.nvmeof.workflows.nvme_utils import delete_nvme_service
 from tests.rbd.rbd_utils import initial_rbd_config
 from utility.log import Log
 from utility.utils import generate_unique_id
-
 
 LOG = Log(__name__)
 
@@ -38,7 +36,7 @@ def configure_listeners(ha, nodes, config):
 
 def configure_subsystems(pool, ha, config):
     """Configure Ceph-NVMEoF Subsystems."""
-    sub_args = {"subsystem": config['nqn']}
+    sub_args = {"subsystem": config["nqn"]}
     ceph_cluster = config["ceph_cluster"]
 
     nvmegwcli = ha.gateways[0]
@@ -91,13 +89,14 @@ def configure_subsystems(pool, ha, config):
                     ns_args = {"args": ns_args}
                     p.spawn(nvmegwcli.namespace.add, **ns_args)
 
+
 def disconnect_initiator(ceph_cluster, node):
     """Disconnect Initiator."""
     node = get_node_by_id(ceph_cluster, node)
     initiator = Initiator(node)
     initiator.disconnect_all()
-    
-    
+
+
 def teardown(ceph_cluster, rbd_obj, config):
     """Cleanup the ceph-nvme gw entities.
 
@@ -118,6 +117,7 @@ def teardown(ceph_cluster, rbd_obj, config):
     # Delete the pool
     if "pool" in config["cleanup"]:
         rbd_obj.clean_up(pools=[config["rbd_pool"]])
+
 
 def run(ceph_cluster: Ceph, **kwargs) -> int:
 
@@ -141,15 +141,17 @@ def run(ceph_cluster: Ceph, **kwargs) -> int:
             ha = HighAvailability(
                 ceph_cluster, gwgroup_config["gw_nodes"], **gwgroup_config
             )
-            clients = ha.prepare_io_execution(initiators)
 
+            # Configure subsystems in GWgroups
             if gwgroup_config.get("subsystems"):
                 for subsys_args in gwgroup_config["subsystems"]:
                     subsys_args["ceph_cluster"] = ceph_cluster
                     configure_subsystems(rbd_pool, ha, subsys_args)
-            for initiator in clients:
+
+            # Prepare and Run FIO on NVMe devices
+            ha.prepare_io_execution(initiators)
+            for initiator in ha.clients:
                 io_tasks.append(executor.submit(initiator.start_fio))
-            time.sleep(20)
 
         return 0
     except Exception as err:
