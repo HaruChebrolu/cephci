@@ -39,15 +39,17 @@ class NVMeGWCLI(ExecuteCommandMixin):
             self.listener,
         ]:
             clas.NVMEOF_CLI_IMAGE = self.NVMEOF_CLI_IMAGE
-
         if "icr.io" in self.NVMEOF_CLI_IMAGE:
-            get_configs()
-            registry = get_registry_credentials("cdn", "ibm")
-            if "stg" in self.NVMEOF_CLI_IMAGE:
-                registry = get_registry_credentials("stage", "ibm")
-            url = registry["registry"]
-            username = registry["username"]
-            password = registry["password"]
+            # get_configs()
+            # registry = get_registry_credentials("cdn", "ibm")
+            # if "stg" in self.NVMEOF_CLI_IMAGE:
+            #     registry = get_registry_credentials("stage", "ibm")
+            # url = registry["registry"]
+            # username = registry["username"]
+            # password = registry["password"]
+            url = "cp.stg.icr.io"
+            username = "cp"
+            password = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJJQk0gTWFya2V0cGxhY2UiLCJlbnYiOiJzdGFnZSIsImlhdCI6MTY4Mzc3NDg1MSwianRpIjoiZWM4ODUyZDFhOWE0NGE3ODkwYWE0YzA1MDdlOTk1NDgifQ.o9Z2h1lbbA_zaeV55QMoTsSlkk-gFt0yJHiTFyApkHs"
             Registry(self.node).login(url, username, password)
 
     def setter(self, attribute, value):
