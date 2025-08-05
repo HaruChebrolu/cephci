@@ -17,9 +17,8 @@ from tests.nvmeof.workflows.ha import HighAvailability
 from tests.nvmeof.workflows.nvme_utils import (
     delete_nvme_service,
     deploy_nvme_service,
-    validate_qos,
-    verify_qos,
 )
+from tests.nvmeof.workflows.qos.qos_utils import validate_qos, verify_qos
 from tests.rbd.rbd_utils import initial_rbd_config
 from utility.log import Log
 from utility.utils import generate_unique_id, run_fio

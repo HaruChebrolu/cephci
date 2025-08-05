@@ -4,7 +4,6 @@ NVMe High Availability Module.
 
 import json
 import time
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from ceph.ceph import CommandFailed
@@ -14,18 +13,22 @@ from ceph.ceph_admin.orch import Orch
 from ceph.parallel import parallel
 from ceph.utils import get_node_by_id, get_openstack_driver
 from ceph.waiter import WaitUntil
+from tests.io.io_utils import get_max_clat_from_fio_output
 from tests.nvmeof.workflows.initiator import NVMeInitiator, validate_initiator
 from tests.nvmeof.workflows.nvme_gateway import NVMeGateway
-from tests.nvmeof.workflows.nvme_utils import deploy_nvme_service
+from tests.nvmeof.workflows.utils import (
+    ana_states,
+    catogorize,
+    check_gateway_availability,
+    compare_client_namespace,
+    fetch_namespaces,
+    get_optimized_state,
+)
 from utility.log import Log
 from utility.retry import retry
 from utility.utils import log_json_dump
 
 LOG = Log(__name__)
-
-
-def get_current_timestamp():
-    return time.perf_counter(), time.asctime()
 
 
 class HighAvailability:
@@ -61,18 +64,6 @@ class HighAvailability:
             "maintanence_mode": self.maintanence_mode,
         }
 
-    def check_gateway(self, node_id):
-        """Check node is NVMeoF Gateway node.
-
-        Args:
-            node_id: Ceph node Id (ex., node6)
-        """
-        for gw in self.gateways:
-            if gw.node.id == node_id:
-                LOG.info(f"[{node_id}] {gw.node.hostname} is NVMeoF Gateway node.")
-                return gw
-        raise Exception(f"{node_id} doesn't match to any gateways provided...")
-
     def get_or_create_initiator(self, node_id, nqn):
         """Get existing NVMeInitiator or create a new one for each (node_id, nqn)."""
         key = (node_id, nqn)  # Use both as dictionary key
@@ -82,145 +73,6 @@ class HighAvailability:
             self.initiators[key] = NVMeInitiator(node, self.gateways[0], nqn)
 
         return self.initiators[key]
-
-    def create_dhchap_key(self, config, update_host_key=False):
-        """Generate DHCHAP key for each initiator and store it."""
-        subnqn = config["subnqn"]
-        group = config["gw_group"]
-        nqn = f"{subnqn}.{group}"
-
-        for host_config in config["hosts"]:
-            node_id = host_config["node"]
-            initiator = self.get_or_create_initiator(node_id, nqn)
-
-            # Generate key for subsystem NQN
-            key, _ = initiator.gen_dhchap_key(n=config["subnqn"])
-            LOG.info(f"{key.strip()} is generated for {nqn} and {node_id}")
-
-            initiator.nqn = config["subnqn"]
-            initiator.auth_mode = config.get("auth_mode")
-            if initiator.auth_mode == "bidirectional" and not update_host_key:
-                initiator.subsys_key = key.strip()
-                initiator.host_key = key.strip()
-            if initiator.auth_mode == "unidirectional":
-                initiator.host_key = key.strip()
-            if update_host_key:
-                initiator.host_key = key.strip()
-            config["dhchap-key"] = key.strip()
-
-            self.clients.append(initiator)
-
-    def catogorize(self, gws):
-        """Categorize to-be failed and running GWs.
-
-        Args:
-            gws: gateways to be failed/stopped/scaled-down
-
-        Returns:
-            list of,
-             - to-be failed gateways
-             - rest of the gateways
-        """
-        fail_gws = []
-        running_gws = []
-
-        # collect impending Gateways to be failed.
-        if isinstance(gws, str):
-            gws = [gws]
-        for gw_id in gws:
-            fail_gws.append(self.check_gateway(gw_id))
-
-        # Collect rest of the Gateways
-        for gw in self.gateways:
-            if gw.node.id not in gws:
-                running_gws.append(gw)
-
-        return fail_gws, running_gws
-
-    @staticmethod
-    def string_to_dict(string):
-        """Parse ANA states from the string."""
-        states = string.replace(" ", "").split(",")
-        dict = {}
-        for state in states:
-            if not state:
-                continue
-            _id, _state = state.split(":")
-            dict[int(_id)] = _state
-        return dict
-
-    def ana_states(self, gw_group=""):
-        """Fetch ANA states and convert into python dict."""
-
-        out, _ = self.orch.shell(
-            args=["ceph", "nvme-gw", "show", self.nvme_pool, repr(self.gateway_group)]
-        )
-        states = {}
-        if self.cluster.rhcs_version >= "8":
-            out = json.loads(out)
-            for gateway in out.get("Created Gateways:"):
-                gw = gateway["gw-id"]
-                states[gw] = gateway
-                states[gw].update(self.string_to_dict(gateway["ana states"]))
-        else:
-            for data in out.split("}"):
-                data = data.strip()
-                if not data:
-                    continue
-                data = json.loads(f"{data}}}")
-                if data.get("ana states"):
-                    gw = data["gw-id"]
-                    states[gw] = data
-                    states[gw].update(self.string_to_dict(data["ana states"]))
-
-        return states
-
-    def check_gateway_availability(self, ana_id, state="AVAILABLE", ana_states=None):
-        """Check for failed ANA GW become unavailable.
-
-        Args:
-            ana_id: Gateway ANA group id.
-            state: Gateway availability state
-            ana_states: Overall ana state. (output from self.ana_states)
-        Return:
-            True if Gateway availability is in expected state, else False
-        """
-        # get ANA states
-        if not ana_states:
-            ana_states = self.ana_states()
-
-        # Check Availability of ANA Group Gateway
-        for _, _state in ana_states.items():
-            if _state["anagrp-id"] == ana_id:
-                if _state["Availability"] == state:
-                    return True
-                return False
-        return False
-
-    def get_optimized_state(self, failed_ana_id):
-        """Fetch the Optimized ANA states for failed gateway.
-
-        Args:
-            gateway: The gateway which is operational.
-            failed_ana_id: failed gateway ANA Group Id.
-
-        Returns:
-            gateways which shows ACTIVE state for failed ANA Group Id
-        """
-        # get ANA states
-        ana_states = self.ana_states()
-
-        # Fetch failed ANA Group Id in ACTIVE state
-        found = []
-
-        for ana_gw_id, state in ana_states.items():
-            if (
-                state["Availability"] == "AVAILABLE"
-                and state.get(failed_ana_id) == "ACTIVE"
-            ):
-                found.append({ana_gw_id: state})
-
-        return found
 
     def system_control(self, gateway, action, wait_for_active_state=True):
         """SystemCtl methods to control nvme unit service states.
@@ -376,7 +228,7 @@ class HighAvailability:
             return False
 
         # Only check the ANA states if the daemon is active
-        states = self.ana_states()
+        states = ana_states()
 
         # Validate the service state for each host
         for host, state in states.items():
@@ -499,247 +351,7 @@ class HighAvailability:
 
         return False
 
-    def scale_down(self, gateway_nodes_to_be_scaleddown):
-        """Scaling down of the NVMeoF Gateways.
-
-        Initiate scale-down
-        - List the gateways which has to be scaled down.
-        - Validate the ANA states of scaled down GWs are optimized in one of the other working GWs.
-
-        Post scale-down Validation
-        - List out namespaces associated with the scaled down Gateways using ANA group ids.
-        - Check for 5 Consecutive times for the increments in write/read to validate IO continuation.
-        """
-        start_counter = float()
-        start_time = str()
-        end_counter = float()
-        end_time = str()
-        LOG.info(f"{gateway_nodes_to_be_scaleddown}: Scaling down NVMe Service")
-
-        if not isinstance(gateway_nodes_to_be_scaleddown, list):
-            gateway_nodes_to_be_scaleddown = [gateway_nodes_to_be_scaleddown]
-
-        to_be_scaledown_gws, operational_gws = self.catogorize(
-            gateway_nodes_to_be_scaleddown
-        )
-        ana_ids = [gw.ana_group_id for gw in to_be_scaledown_gws]
-        gateway = operational_gws[0]
-
-        # Validate IO and scale operation
-        old_namespaces = self.fetch_namespaces(gateway, ana_ids)
-        self.validate_io(old_namespaces)
-
-        # Scale down
-        gwnodes_to_be_deployed = list(
-            set(self.config["gw_nodes"]) - set(gateway_nodes_to_be_scaleddown)
-        )
-        self.config["gw_nodes"] = gwnodes_to_be_deployed
-        deploy_nvme_service(self.cluster, self.config)
-
-        self.gateways = []
-        for gateway in self.config["gw_nodes"]:
-            gw_node = get_node_by_id(self.cluster, gateway)
-            self.gateways.append(NVMeGateway(gw_node, self.mtls))
-
-        start_counter, start_time = get_current_timestamp()
-        for gateway in to_be_scaledown_gws:
-            hostname = gateway.hostname
-
-            if self.cluster.rhcs_version == "8":
-                # Wait until 60 seconds
-                for w in WaitUntil():
-                    # Check for gateway unavailability
-                    if self.check_gateway_availability(
-                        gateway.ana_group_id, state="DELETING"
-                    ):
-                        LOG.info(f"[ {gateway} ] NVMeofGW service is UNAVAILABLE.")
-                        active = self.get_optimized_state(gateway.ana_group_id)
-
-                        # Find optimized path
-                        if active:
-                            LOG.info(
-                                f"{list(active[0])} is new and only Active GW for failed {hostname}"
-                            )
-                            break
-
-                    LOG.warning(f"[ {hostname} ] is still in AVAILABLE state..")
-
-                if w.expired:
-                    raise TimeoutError(
-                        f"[ {hostname} ] Scale down of NVMeofGW service failed after 60s timeout.."
-                    )
-
-            end_counter, end_time = get_current_timestamp()
-            LOG.info(
-                f"[ {hostname} ] Total time taken to scale down - {end_counter - start_counter} seconds"
-            )
-
-            result = {
-                "scale-down-start-time": start_time,
-                "scale-down-end-time": end_time,
-                "scale-down-start-counter-time": start_counter,
-                "scale-down-end-counter-time": end_counter,
-            }
-            LOG.info(log_json_dump(result))
-
-            # Validate auto load balance if rhcs version is 8.1
-            if self.cluster.rhcs_version == "8.1":
-                time.sleep(60)
-                validate_ns_balance = self.validate_auto_loadbalance()
-                LOG.info(f"Validated namespaces in each GW:{validate_ns_balance}")
-            # Validate IO post scale down
-            self.validate_io(set(list(old_namespaces)))
-            return result
-
-    def validate_scaleup(self, scaleup_nodes, namespaces):
-        """
-        - List out namespaces associated with the new Gateways using ANA group ids.
-        - Check for 5 Consecutive times for the increments in write/read to validate IO continuation.
-
-        Args:
-            scaleup_nodes (list): A list of gateway nodes to be scaled up.
-        """
-        start_counter = float()
-        start_time = str()
-        end_counter = float()
-        end_time = str()
-        new_gws = []
-
-        for gateway_node in scaleup_nodes:
-            gw = get_node_by_id(self.cluster, gateway_node)
-            new_gws.append(NVMeGateway(gw, self.mtls))
-
-        start_counter, start_time = get_current_timestamp()
-        for gateway in new_gws:
-            hostname = gateway.hostname
-
-            # Wait until 60 seconds
-            for w in WaitUntil(timeout=60):
-                # Check for gateway availability
-                if self.check_gateway_availability(gateway.ana_group_id):
-                    LOG.info(f"[ {gateway} ] NVMeofGW service is AVAILABLE.")
-                    state = self.get_optimized_state(gateway.ana_group_id)
-
-                    # check gateway for its own original path.
-                    if gateway.ana_group["name"] in state[0]:
-                        end_counter, end_time = get_current_timestamp()
-                        LOG.info(
-                            f"{hostname} restored to original path - {log_json_dump(state)}"
-                        )
-                        break
-
-                LOG.warning(f"[ {hostname} ] is still not in AVAILABLE state..")
-
-            if w.expired:
-                raise TimeoutError(
-                    f"[ {hostname} ] Scale up of NVMeofGW service failed after 120s timeout.."
-                )
-
-            LOG.info(
-                f"[ {hostname} ] Total time taken to scale up - {end_counter - start_counter} seconds"
-            )
-            result = {
-                "scale-up-start-time": start_time,
-                "scale-up-end-time": end_time,
-                "scale-up-start-counter-time": start_counter,
-                "scale-up-end-counter-time": end_counter,
-            }
-            LOG.info(log_json_dump(result))
-            # Validate auto load balance if rhcs version is 8.1
-            if self.cluster.rhcs_version == "8.1":
-                time.sleep(60)
-                validate_ns_balance = self.validate_auto_loadbalance()
-                LOG.info(f"Validated namespaces in each GW:{validate_ns_balance}")
-            # Validate IO post scale up
-            self.validate_io(set(list(namespaces)))
-            return result
-
-    def scale_up(self, scaleup_nodes, gw_nodes, existing_namespaces):
-        """Scaling up of the NVMeoF Gateways.
-
-        Initiate scale-up
-        - Spin up the new gateways.
-        - Validate the ANA states of new GWs are optimized.
-
-        Pre scale-up Validation
-        - List out namespaces associated with the new Gateways using ANA group ids.
-        - Check for 5 Consecutive times for the increments in write/read to validate IO continuation.
-
-        Post scale-up Validation
-        - Check if Ana group ids of replaced GWs took over the original ANA group ids
-        """
-        existing_namespaces = []
-        LOG.info(f"{scaleup_nodes}: Scaling up NVMe Service")
-
-        if not isinstance(scaleup_nodes, list):
-            scaleup_nodes = [scaleup_nodes]
-
-        # Validate IO before scale up operation
-        self.validate_io(set(list(existing_namespaces)))
-
-        # Scale up
-        gwnodes_to_be_deployed = list(set(self.config["gw_nodes"] + scaleup_nodes))
-        self.config["gw_nodes"] = gwnodes_to_be_deployed
-        deploy_nvme_service(self.cluster, self.config)
-
-        self.gateways = []
-        for gateway in gwnodes_to_be_deployed:
-            gw_node = get_node_by_id(self.cluster, gateway)
-            self.gateways.append(NVMeGateway(gw_node, self.mtls))
-
-        # Validate ana_grp_ids post scale up
-        for scaleup_node in scaleup_nodes:
-            for gw_node in gw_nodes:
-                if gw_node.node.id == scaleup_node:
-                    gw = self.check_gateway(gw_node.node.id)
-                    scaleup_gw = self.check_gateway(scaleup_node)
-                    if gw.ana_group_id == scaleup_gw.ana_group_id:
-                        LOG.info("Scaleup nodes took over the previous anagrpids")
-                    else:
-                        raise Exception("anagrpids are not matching after scaleup")
-
-    def validate_auto_loadbalance(self, gw_group=""):
-        """
-        Fetch the namespace count on each Gateway and compare them.
-        Ensure that the number of namespaces for each GW is within the range [num_namespaces_per_gw + or - len(GWs)].
-        """
-        out, _ = self.orch.shell(
-            args=["ceph", "nvme-gw", "show", self.nvme_pool, repr(self.gateway_group)]
-        )
-        out = json.loads(out)
-        total_num_namespaces = out.get("num-namespaces")
-        gateways = out.get("Created Gateways:", [])
-        total_gateways = len(gateways)
-        if total_gateways == 0:
-            raise Exception("No gateways found in the output.")
-
-        num_namespaces_per_gw = total_num_namespaces / total_gateways
-        namespaces = {}
-        LOG.info(f"Total namespace in GW group : {total_num_namespaces}")
-        LOG.info(f"Total GWs: {total_gateways}")
-        LOG.info(f"Namespaces per GW : {num_namespaces_per_gw}")
-
-        for gateway in gateways:
-            gw_id = gateway["gw-id"]
-            num_namespaces = gateway["num-namespaces"]
-            lower_range = num_namespaces_per_gw - total_gateways
-            upper_range = num_namespaces_per_gw + total_gateways
-            LOG.info(
-                f"namespace per GW must be in range between {lower_range} and {upper_range}"
-            )
-
-            if not (lower_range <= num_namespaces <= upper_range):
-                raise Exception(
-                    f"Gateway '{gw_id}' has an invalid num-namespaces: {num_namespaces}. "
-                    f"It must be between {lower_range} and {upper_range}."
-                )
-
-            namespaces[gw_id] = gateway
-            namespaces[gw_id]["num-namespaces"] = num_namespaces
-
-        return namespaces
-
-    def failover(self, gateway, fail_tool):
+    def failover(self, gateway, fail_tool, namespaces):
         """HA Failover on the NVMeoF Gateways.
 
         Initiate Failover
@@ -752,62 +364,88 @@ class HighAvailability:
         - Check for 5 Consecutive times for the increments in write/read to validate IO continuation.
         """
         hostname = gateway.hostname
-        start_counter = float()
-        start_time = str()
-        end_counter = float()
-        end_time = str()
+        io_tasks = []
+        executor = ThreadPoolExecutor(max_workers=len(self.clients))
 
-        # Initiate Failover
-        fail_op = self.fail_ops[fail_tool]
-        LOG.info(f"[ {hostname} ]: Failing Over NVMe Service using {fail_tool} command")
-        res = fail_op(gateway=gateway, action="stop", wait_for_active_state=False)
-        if not res:
-            raise Exception(
-                f"[ {hostname} ]: Error in stopping NVMe Service using {fail_tool} command "
+        try:
+            # Start IO Execution
+            for initiator in self.clients:
+                io_tasks.append(executor.submit(initiator.start_fio, "1G"))
+            time.sleep(20)  # time sleep for IO to Kick-in
+
+            self.validate_io(namespaces)
+
+            # Initiate Failover
+            fail_op = self.fail_ops[fail_tool]
+            LOG.info(
+                f"[ {hostname} ]: Failing Over NVMe Service using {fail_tool} command"
             )
-        start_counter, start_time = get_current_timestamp()
+            res = fail_op(gateway=gateway, action="stop", wait_for_active_state=False)
+            if not res:
+                raise Exception(
+                    f"[ {hostname} ]: Error in stopping NVMe Service using {fail_tool} command "
+                )
 
-        # Wait until 60 seconds
-        for w in WaitUntil():
-            # Check for gateway unavailability
-            if self.check_gateway_availability(
-                gateway.ana_group_id, state="UNAVAILABLE"
-            ):
-                LOG.info(f"[ {hostname} ] NVMeofGW service is UNAVAILABLE.")
-                active = self.get_optimized_state(gateway.ana_group_id)
+            # Wait until 60 seconds
+            for w in WaitUntil():
+                # Check for gateway unavailability
+                if check_gateway_availability(
+                    gateway.ana_group_id, state="UNAVAILABLE"
+                ):
+                    LOG.info(f"[ {hostname} ] NVMeofGW service is UNAVAILABLE.")
+                    active = get_optimized_state(gateway.ana_group_id)
 
-                # Find optimized path
-                # Condition to fail if multiple Active path exists for a gateway.
-                if active and 1 <= len(active) < 2:
-                    end_counter, end_time = get_current_timestamp()
-                    LOG.info(
-                        f"{list(active[0])} is new and only Active GW for failed {hostname}"
-                    )
-                    break
+                    # Find optimized path
+                    # Condition to fail if multiple Active path exists for a gateway.
+                    if active and 1 <= len(active) < 2:
+                        end_counter, end_time = get_current_timestamp()
+                        LOG.info(
+                            f"{list(active[0])} is new and only Active GW for failed {hostname}"
+                        )
+                        break
 
-                if len(active) > 1:
-                    raise Exception(
-                        f"[ {hostname} ] Found more than one Active path - {log_json_dump(active)}"
-                    )
-            LOG.warning(f"[ {hostname} ] is still in AVAILABLE state..")
+                    if len(active) > 1:
+                        raise Exception(
+                            f"[ {hostname} ] Found more than one Active path - {log_json_dump(active)}"
+                        )
+                LOG.warning(f"[ {hostname} ] is still in AVAILABLE state..")
 
-        if w.expired:
-            raise TimeoutError(
-                f"[ {hostname} ] Failover of NVMeofGW service failed after 60s timeout.."
-            )
+            if w.expired:
+                raise TimeoutError(
+                    f"[ {hostname} ] Failover of NVMeofGW service failed after 60s timeout.."
+                )
+            self.validate_io(namespaces)
 
-        LOG.info(
-            f"[ {hostname} ] Total time taken to failover - {end_counter - start_counter} seconds"
-        )
-        return {
-            "failover-start-time": start_time,
-            "failover-end-time": end_time,
-            "failover-start-counter-time": start_counter,
-            "failover-end-counter-time": end_counter,
-            "failed-gw": gateway,
-        }
+            return {
+                "failed-gw": gateway,
+            }
 
-    def failback(self, gateway, fail_tool):
+        except BaseException as err:  # noqa
+            raise Exception(err)
+
+        finally:
+            # Wait for IO to complete and collect FIO outputs
+            if io_tasks:
+                LOG.info("Waiting for completion of IOs.")
+                executor.shutdown(wait=True, cancel_futures=True)
+                fio_outputs = []
+
+                for task in io_tasks:
+                    try:
+                        fio_outputs.append(task.result())
+                    except Exception as e:
+                        LOG.error(f"FIO execution failed: {e}")
+
+            # Extract failover time
+            for idx, output in enumerate(fio_outputs):
+                try:
+                    max_clat_in_ms = get_max_clat_from_fio_output(output[0][0])
+                    max_clat_in_sec = max_clat_in_ms / 1000
+                    LOG.info(f"Failover time for {max_clat_in_sec} ms")
+                except Exception as e:
+                    LOG.error(f"Failed to parse FIO output: {e}")
+
+    def failback(self, gateway, fail_tool, namespaces):
         """Failback the Gateways.
 
         Args:
@@ -815,80 +453,91 @@ class HighAvailability:
             fail_tool: tool to fail the GW service
         """
         hostname = gateway.hostname
-        start_counter = float()
-        start_time = str()
-        end_counter = float()
-        end_time = str()
+        io_tasks = []
+        executor = ThreadPoolExecutor(max_workers=len(self.clients))
 
         # Initiate Fail-back
         fail_op = self.fail_ops[fail_tool]
         LOG.info(
             f"[ {hostname} ]: Failback / Restore Gateway using {fail_tool} command"
         )
-        res = fail_op(gateway=gateway, action="start", wait_for_active_state=True)
-        if not res:
-            raise Exception(
-                f"[ {hostname} ]: Error in starting NVMe Service using {fail_tool} command "
-            )
-        start_counter, start_time = get_current_timestamp()
+        try:
+            # Start IO Execution
+            for initiator in self.clients:
+                io_tasks.append(executor.submit(initiator.start_fio, "2G"))
+            time.sleep(20)  # time sleep for IO to Kick-in
 
-        for w in WaitUntil():
-            # Check for gateway availability
-            if self.check_gateway_availability(gateway.ana_group_id):
-                LOG.info(f"[ {hostname} ] NVMeofGW service is AVAILABLE.")
+            self.validate_io(namespaces)
 
-                active = self.get_optimized_state(gateway.ana_group_id)
-                if active and 1 <= len(active) < 2:
-                    state = active[0]
+            res = fail_op(gateway=gateway, action="start", wait_for_active_state=True)
+            if not res:
+                raise Exception(
+                    f"[ {hostname} ]: Error in starting NVMe Service using {fail_tool} command "
+                )
 
-                    # check gateway for its own original path.
-                    if gateway.ana_group["name"] in state:
-                        end_counter, end_time = get_current_timestamp()
-                        LOG.info(
-                            f"{hostname} restored to original path - {log_json_dump(state)}"
+            for w in WaitUntil():
+                # Check for gateway availability
+                if check_gateway_availability(gateway.ana_group_id):
+                    LOG.info(f"[ {hostname} ] NVMeofGW service is AVAILABLE.")
+
+                    active = get_optimized_state(gateway.ana_group_id)
+                    if active and 1 <= len(active) < 2:
+                        state = active[0]
+
+                        # check gateway for its own original path.
+                        if gateway.ana_group["name"] in state:
+                            end_counter, end_time = get_current_timestamp()
+                            LOG.info(
+                                f"{hostname} restored to original path - {log_json_dump(state)}"
+                            )
+                            break
+
+                    if len(active) > 1:
+                        raise Exception(
+                            f"[ {hostname} ] More than one Active path found - {log_json_dump(active)}"
                         )
-                        break
+                    LOG.warning(f"[ {hostname} ] No Active path found")
+                    continue
 
-                if len(active) > 1:
-                    raise Exception(
-                        f"[ {hostname} ] More than one Active path found - {log_json_dump(active)}"
-                    )
-                LOG.warning(f"[ {hostname} ] No Active path found")
+                LOG.warning(f"[ {hostname} ] is still not in AVAILABLE state..")
                 continue
 
-            LOG.warning(f"[ {hostname} ] is still not in AVAILABLE state..")
-            continue
+            if w.expired:
+                raise TimeoutError(
+                    f"[ {hostname} ] Fail-back of NVMeofGW service failed even after 60s timeout.."
+                )
+            self.validate_io(namespaces)
 
-        if w.expired:
-            raise TimeoutError(
-                f"[ {hostname} ] Fail-back of NVMeofGW service failed even after 60s timeout.."
-            )
-        LOG.info(
-            f"[ {hostname} ] Time taken to Failback - {end_counter - start_counter} seconds"
-        )
-        return {
-            "failback-start-time": start_time,
-            "failback-end-time": end_time,
-            "failback-start-counter-time": start_counter,
-            "failback-end-counter-time": end_counter,
-            "failed-gw": gateway,
-        }
+            return {
+                "failed-gw": gateway,
+            }
 
-    @retry(IOError, tries=3, delay=3)
-    def compare_client_namespace(self, uuids):
-        lsblk_devs = []
-        for client in self.clients:
-            lsblk_devs.extend(client.fetch_lsblk_nvme_devices())
+        except BaseException as err:  # noqa
+            raise Exception(err)
 
-        LOG.info(
-            f"Expected NVMe Targets : {set(list(uuids))} Vs LSBLK devices: {set(list(lsblk_devs))}"
-        )
-        if sorted(uuids) != sorted(set(lsblk_devs)):
-            raise IOError("Few Namespaces are missing!!!")
-        LOG.info("All namespaces are listed at Client(s)")
-        return True
+        finally:
+            # Wait for IO to complete and collect FIO outputs
+            if io_tasks:
+                LOG.info("Waiting for completion of IOs.")
+                executor.shutdown(wait=True, cancel_futures=True)
+                fio_outputs = []
 
-    def prepare_io_execution(self, io_clients, return_clients=False):
+                for task in io_tasks:
+                    try:
+                        fio_outputs.append(task.result())
+                    except Exception as e:
+                        LOG.error(f"FIO execution failed: {e}")
+
+            # Extract failback time
+            for idx, output in enumerate(fio_outputs):
+                try:
+                    max_clat_in_ms = get_max_clat_from_fio_output(output[0][0])
+                    max_clat_in_sec = max_clat_in_ms / 1000
+                    LOG.info(f"Failback time for {max_clat_in_sec} ms")
+                except Exception as e:
+                    LOG.error(f"Failed to parse FIO output: {e}")
+
+    def prepare_io_execution(self, io_clients):
         """Prepare FIO Execution.
 
         initiators:                             # Configure Initiators with all pre-req
@@ -904,53 +553,9 @@ class HighAvailability:
             client.connect_targets(io_client)
             if client not in self.clients:
                 self.clients.append(client)
-        if return_clients:
-            return self.clients
-
-    def fetch_namespaces(self, gateway, failed_ana_grp_ids=[], get_list=False):
-        """Fetch all namespaces for failed gateways.
-
-        Args:
-            gateway: Operational gateway
-            failed_ana_grp_ids: Failed or to-be failed gateway ids
-        Returns:
-            list of namespaces
-        """
-        args = {"base_cmd_args": {"format": "json"}}
-        _, subsystems = gateway.subsystem.list(**args)
-        subsystems = json.loads(subsystems)
-
-        namespaces = []
-        all_ns = []
-        for subsystem in subsystems["subsystems"]:
-            sub_name = subsystem["nqn"]
-            cmd_args = {"args": {"subsystem": subsystem["nqn"]}}
-            _, nspaces = gateway.namespace.list(**{**args, **cmd_args})
-            nspaces = json.loads(nspaces)["namespaces"]
-            all_ns.extend(nspaces)
-
-            if failed_ana_grp_ids:
-                for ns in nspaces:
-                    if ns["load_balancing_group"] in failed_ana_grp_ids:
-                        # <subsystem>|<nsid>|<pool_name>|<image>
-                        ns_info = f"nsid-{ns['nsid']}|{ns['rbd_pool_name']}|{ns['rbd_image_name']}"
-                        if get_list:
-                            namespaces.append(
-                                {"list": ns, "info": f"{sub_name}|{ns_info}"}
-                            )
-                        else:
-                            namespaces.append(f"{sub_name}|{ns_info}")
-        if not failed_ana_grp_ids:
-            LOG.info(f"All namespaces : {log_json_dump(all_ns)}")
-            return all_ns
-
-        LOG.info(
-            f"Namespaces found for ANA-grp-id [{failed_ana_grp_ids}]: {log_json_dump(namespaces)}"
-        )
-        return namespaces
 
     @retry((IOError, TimeoutError, CommandFailed), tries=7, delay=2)
-    def validate_io(self, namespaces, negative=False):
+    def validate_io(self, namespaces):
         """Validate Continuous IO on namespaces.
 
         - Collect rbd disk usage info for each rbd image.
@@ -992,305 +597,27 @@ class HighAvailability:
                 )
                 LOG.info(f"[ {subsys}|{pool_img} ] RBD DU samples - {res}")
                 if not validate_incremetal_io(res):
-                    if negative:
-                        LOG.info(
-                            f"[ {subsys}|{pool_img} ] IO is not progressing as expected - {res}"
-                        )
-                        continue
                     raise IOError(
                         f"[ {subsys}|{pool_img} ] IO is not progressing - {res}"
-                    )
-                if negative:
-                    LOG.error(
-                        f"[ {subsys}|{pool_img} ] IO is progressing as expected - {res}"
-                    )
-                    raise IOError(
-                        f"[ {subsys}|{pool_img} ] IO is progressing as expected - {res}"
                     )
                 LOG.info(f"IO validation for {subsys}|{pool_img} is successful.")
 
         LOG.info("IO Validation is Successfull on all RBD images..")
 
-    def validate_init_namespace_masking(
-        self,
-        command,
-        init_nodes,
-        expected_visibility,
-        validate_config=None,
-    ):
-        """Validate that the namespace visibility is correct from all initiators."""
-        for node in init_nodes:
-            initiator_node = get_node_by_id(self.cluster, node)
-            client = NVMeInitiator(initiator_node, self.gateways[0])
-            client.disconnect_all()  # Reconnect NVMe targets
-            client.connect_targets(config={"nqn": "connect-all"})
-            serial_to_namespace = defaultdict(set)
-
-            out, _ = initiator_node.exec_command(
-                sudo=True, cmd="cat /etc/os-release | grep VERSION_ID"
-            )
-            rhel_version = out.split("=")[1].strip().strip('"')
-
-            @retry(
-                IOError,
-                tries=4,
-                delay=3,
-            )
-            def execute_nvme_command(client_node):
-                devices_json, _ = client_node.exec_command(
-                    cmd="nvme list --output-format=json", sudo=True
-                )
-                return json.loads(devices_json)["Devices"]
-
-            devices_json = execute_nvme_command(initiator_node)
-            if not devices_json:
-                LOG.info(f"No devices found on node {node}")
-                continue
-
-            for device in devices_json:
-                if rhel_version == "9.5":
-                    key = device["NameSpace"]
-                    value = int(device["SerialNumber"])
-                    serial_to_namespace[key].add(value)
-                elif rhel_version == "9.6":
-                    for subsys in device.get("Subsystems", []):
-                        for controller in subsys.get("Controllers", []):
-                            if controller.get("ModelNumber") == "Ceph bdev Controller":
-                                serial = controller.get("SerialNumber", "")
-                                value = int(serial)
-                                for ns in subsys.get("Namespaces", []):
-                                    key = ns.get("NSID")
-                                    serial_to_namespace[key].add(value)
-
-            def subsystem_nsid_found(dictionary, key, value):
-                return key in dictionary and value in dictionary[key]
-
-            if validate_config:
-                args = (validate_config or {}).get("args", {})
-                subsystem_to_nsid = {args["nsid"]: args["sub_num"]}
-                init_node = args.get("init_node")
-                ns_to_check, subsystem_to_check = next(iter(subsystem_to_nsid.items()))
-                LOG.info(f"{subsystem_to_nsid} : {serial_to_namespace}")
-                ns_subsys_found = subsystem_nsid_found(
-                    serial_to_namespace, ns_to_check, subsystem_to_check
-                )
-
-                if command == "add_host":
-                    if node == init_node:
-                        if ns_subsys_found:
-                            LOG.info(
-                                f"Validated - Namespace:Subsystem pair {subsystem_to_nsid} is listed on {node}"
-                            )
-                        else:
-                            LOG.error(
-                                f"Namespace:Subsystem pair {subsystem_to_nsid} is not listed on {node}"
-                            )
-                            raise Exception(
-                                f"Expected Namespace:Subsystem pair {subsystem_to_nsid} on {node} but did not find it"
-                            )
-                    else:
-                        if ns_subsys_found:
-                            LOG.error(
-                                f"Namespace:Subsystem pair {subsystem_to_nsid} is listed on {node}"
-                            )
-                            raise Exception(
-                                f"Did not expect Namespace:Subsystem pair {subsystem_to_nsid} on {node} but found it"
-                            )
-                        else:
-                            LOG.info(
-                                f"Validated - Namespace:Subsystem pair {subsystem_to_nsid} is not listed on {node}"
-                            )
-                elif command == "del_host":
-                    if node == init_node:
-                        if ns_subsys_found:
-                            LOG.error(
-                                f"Namespace:Subsystem pair {subsystem_to_nsid} is listed on {node}"
-                            )
-                            raise Exception(
-                                f"Did not expect Namespace:Subsystem pair {subsystem_to_nsid} on {node} but found it"
-                            )
-                        else:
-                            LOG.info(
-                                f"Validated - Namespace:Subsystem pair {subsystem_to_nsid} is not listed on {node}"
-                            )
-                    else:
-                        if ns_subsys_found:
-                            LOG.error(
-                                f"Namespace:Subsystem pair {subsystem_to_nsid} is listed on {node}"
-                            )
-                            raise Exception(
-                                f"Did not expect Namespace:Subsystem pair {subsystem_to_nsid} on {node} but found it"
-                            )
-                        else:
-                            LOG.info(
-                                f"Validated - Namespace:Subsystem pair {subsystem_to_nsid} is not listed on {node}"
-                            )
-            else:
-                if (
-                    not expected_visibility
-                ):  # If expected visibility is False, devices should be empty
-                    # Determine if devices list is empty (no Namespaces in any Subsystem)
-                    devices_json_empty = (
-                        all(
-                            not subsys.get("Namespaces")  # True if empty or missing
-                            for device in devices_json
-                            for subsys in device.get("Subsystems", [])
-                        )
-                        if rhel_version == "9.6"
-                        else not devices_json
-                    )
-                    if not devices_json_empty:  # Check if Devices is not empty
-                        LOG.error(
-                            f"Expected no devices for initiator {node}, but found: {devices_json}"
-                        )
-                        raise Exception(
-                            f"Initiator {node} has devices when NS visibility is restricted"
-                        )
-                    else:
-                        LOG.info(f"Validated - no devices found on {node}")
-                elif (
-                    expected_visibility
-                ):  # If expected visibility is True, devices should not be empty
-                    devices_json_empty = (
-                        all(
-                            not subsys.get("Namespaces")  # True if empty or missing
-                            for device in devices_json
-                            for subsys in device.get("Subsystems", [])
-                        )
-                        if rhel_version == "9.6"
-                        else not devices_json
-                    )
-                    if devices_json_empty:
-                        LOG.error(
-                            f"Expected devices to be visible for node {node}, but found none."
-                        )
-                        raise Exception(
-                            f"Initiator {node} has no devices when NS visibility is restricted"
-                        )
-                    else:
-                        # Log Namespace and SerialNumber from each device
-                        for device in devices_json:
-                            if rhel_version == "9.5":
-                                namespace = device.get("NameSpace", None)
-                                serial_number = device.get("SerialNumber", None)
-                            elif rhel_version == "9.6":
-                                for subsys in device.get("Subsystems", []):
-                                    for controller in subsys.get("Controllers", []):
-                                        if (
-                                            controller.get("ModelNumber")
-                                            == "Ceph bdev Controller"
-                                        ):
-                                            serial_number = int(
-                                                controller.get("SerialNumber", "")
-                                            )
-                                            for ns in subsys.get("Namespaces", []):
-                                                namespace = ns.get("NSID")
-                                                LOG.info(
-                                                    f"Namespace: {namespace}, SerialNumber: {serial_number}"
-                                                )
-                        LOG.info(
-                            f"Validated - {len(devices_json)} devices found on {node}"
-                        )
-
-    def validate_namespace_masking(
-        self,
-        nsid,
-        subnqn,
-        namespaces_sub,
-        hostnqn_dict,
-        ns_visibility,
-        command,
-        expected_visibility,
-    ):
-        """Validate that the namespace visibility is correct."""
-
-        if command == "add_host":
-            LOG.info(command)
-            num_namespaces_per_node = namespaces_sub // len(hostnqn_dict)
-
-            # Determine the initiator node responsible for this nsid based on the calculated range
-            node_index = (nsid - 1) // num_namespaces_per_node
-            expected_host = list(hostnqn_dict.values())[node_index]
-
-            # Log the visibility of the namespace
-            if expected_host in ns_visibility:
-                LOG.info(
-                    f"Validated - Namespace {nsid} of {subnqn} has the correct nqn {ns_visibility}"
-                )
-            else:
-                LOG.error(
-                    f"Namespace {nsid} of {subnqn} has incorrect NQN. Expected {expected_host}, but got {ns_visibility}"
-                )
-                raise Exception(
-                    f"Namespace {nsid} of {subnqn} has incorrect NQN. Expected {expected_host}, but got {ns_visibility}"
-                )
-
-        elif command == "del_host":
-            LOG.info(command)
-            num_namespaces_per_node = namespaces_sub // len(hostnqn_dict)
-
-            # Determine the initiator node responsible for this nsid based on the calculated range
-            node_index = (nsid - 1) // num_namespaces_per_node
-            expected_host = list(hostnqn_dict.values())[node_index]
-
-            # Log the visibility of the namespace
-            if expected_host not in ns_visibility:
-                LOG.info(
-                    f"Validated - Namespace {nsid} of {subnqn} does not has {expected_host}"
-                )
-            else:
-                LOG.error(
-                    f"Namespace {nsid} of {subnqn} has {ns_visibility} which was removed"
-                )
-                raise Exception(
-                    f"Namespace {nsid} of {subnqn} has incorrect NQN. Not expecting {ns_visibility} in {expected_host}"
-                )
-
-        else:
-            # Validate visibility based on the expected value (for non-add/del host commands)
-            # ns_visibility = str(ns_visibility)
-            LOG.info(command)
-            # if ns_visibility.lower() == expected_visibility.lower():
-            if ns_visibility == expected_visibility:
-                LOG.info(
-                    f"Validated - Namespace {nsid} has correct visibility: {ns_visibility}"
-                )
-                LOG.error(
-                    f"NS {nsid} of {subnqn} has wrong visibility.Expected {expected_visibility} got{ns_visibility}"
-                )
-                raise Exception(
-                    f"NS {nsid} of {subnqn} has wrong visibility.Expected {expected_visibility} got {ns_visibility}"
-                )
-
     def run(self):
         """Execute the HA failover and failback with IO validation."""
         fail_methods = self.config["fault-injection-methods"]
         initiators = self.config["initiators"]
-        io_tasks = []
 
         try:
             # Prepare FIO Execution
-            namespaces = self.fetch_namespaces(self.gateways[0])
-            if len(namespaces) >= 1:
-                max_workers = (
-                    len(initiators) * len(namespaces) if initiators else len(namespaces)
-                )  # 20 devices + 10 buffer per initiator
-                executor = ThreadPoolExecutor(
-                    max_workers=max_workers,
-                )
-            else:
-                executor = ThreadPoolExecutor()
-
+            namespaces = fetch_namespaces(self.gateways[0])
             self.prepare_io_execution(initiators)
 
             # Check for targets at clients
-            self.compare_client_namespace([i["uuid"] for i in namespaces])
+            compare_client_namespace([i["uuid"] for i in namespaces])
 
             repeat_ha_count = self.config.get("repeat_ha_count", 1)
-            # Start IO Execution
-            for initiator in self.clients:
-                io_tasks.append(executor.submit(initiator.start_fio))
-            time.sleep(20)  # time sleep for IO to Kick-in
 
             # Failover and Failback
             for i in range(0, repeat_ha_count):
@@ -1306,13 +633,13 @@ class HighAvailability:
                     )
                     log_json_dump(fail_method)
 
-                    fail_gws, _ = self.catogorize(nodes)
+                    fail_gws, _ = catogorize(nodes)
                     fail_gw_ana_ids = []
                     namespaces = []
                     all_failed_ns = {}
                     for gw in fail_gws:
                         fail_gw_ana_ids.append(gw.ana_group_id)
-                        namespaces_gw = self.fetch_namespaces(
+                        namespaces_gw = fetch_namespaces(
                             gw, [gw.ana_group_id], get_list=True
                         )
                         ns_list = [ns.get("list") for ns in namespaces_gw]
@@ -1324,23 +651,22 @@ class HighAvailability:
                         all_failed_ns.update({gw.ana_group_id: ns_list})
                         validate_initiator(self.clients, gw, ns_list)
 
-                    self.validate_io(namespaces)
-
                     # Fail Over
                     with parallel() as p:
                         for gw in fail_gws:
                             if fail_tool == "daemon_redeploy":
                                 p.spawn(self.daemon_redeploy, gw)
                             else:
-                                p.spawn(self.failover, gw, fail_tool)
+                                p.spawn(self.failover, gw, fail_tool, namespaces)
                         for result in p:
                             if not isinstance(result, dict):
                                 raise Exception("Failover failed")
                             failed_gw = result.pop("failed-gw", None)
                             if not failed_gw:
-                                raise Exception("Faileover failed")
+                                raise Exception("Failover failed")
+
                         for gw in fail_gws:
-                            active = self.get_optimized_state(gw.ana_group_id)
+                            active = get_optimized_state(gw.ana_group_id)
                             active_gw = list(active[0])[0]
                             LOG.info(log_json_dump(result))
                             active_gw_obj = [
@@ -1350,9 +676,9 @@ class HighAvailability:
                             ][0]
                             LOG.info(
                                 f"Active gateway after failover for {gw.node.ip_address} is \
-                                    {active_gw_obj.node.ip_address}"
+                                {active_gw_obj.node.ip_address}"
                             )
-                            namespaces_gw = self.fetch_namespaces(
+                            namespaces_gw = fetch_namespaces(
                                 active_gw_obj, [gw.ana_group_id], get_list=True
                             )
                             ns_list = [ns.get("list") for ns in namespaces_gw]
@@ -1361,13 +687,12 @@ class HighAvailability:
                                     failover are {ns_list}"
                             )
                             validate_initiator(self.clients, active_gw_obj, ns_list, gw)
-                        self.validate_io(namespaces)
 
                     # Fail Back
                     if fail_tool != "daemon_redeploy":
                         with parallel() as p:
                             for gw in fail_gws:
-                                p.spawn(self.failback, gw, fail_tool)
+                                p.spawn(self.failback, gw, fail_tool, namespaces)
                             for result in p:
                                 if not isinstance(result, dict):
                                     raise Exception("Failback failed")
@@ -1375,7 +700,7 @@ class HighAvailability:
                                 LOG.info(log_json_dump(result))
                                 if not failed_gw:
                                     raise Exception("Failback failed")
-                                namespaces_gw = self.fetch_namespaces(
+                                namespaces_gw = fetch_namespaces(
                                     failed_gw, [failed_gw.ana_group_id], get_list=True
                                 )
                                 ns_list = [ns.get("list") for ns in namespaces_gw]
@@ -1390,7 +715,3 @@ class HighAvailability:
                         time.sleep(20)
         except BaseException as err:  # noqa
             raise Exception(err)
-        finally:
-            if io_tasks:
-                LOG.info("Waiting for completion of IOs.")
-                executor.shutdown(wait=True, cancel_futures=True)

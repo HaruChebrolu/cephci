@@ -16,6 +16,7 @@ from ceph.parallel import parallel
 from ceph.utils import get_node_by_id
 from tests.nvmeof.workflows.ha import HighAvailability
 from tests.nvmeof.workflows.nvme_utils import delete_nvme_service, deploy_nvme_service
+from tests.nvmeof.workflows.utils import fetch_namespaces
 from tests.rbd.rbd_utils import initial_rbd_config
 from utility.log import Log
 from utility.utils import generate_unique_id
@@ -536,7 +537,7 @@ def run(ceph_cluster: Ceph, **kwargs) -> int:
                         LOG.info(f"Started scaling down {gateway_nodes_to_be_deployed}")
 
                         # Prepare FIO Execution
-                        namespaces = ha.fetch_namespaces(ha.gateways[0])
+                        namespaces = fetch_namespaces(ha.gateways[0])
                         ha.prepare_io_execution(initiators)
 
                         # Check for targets at clients
@@ -557,7 +558,7 @@ def run(ceph_cluster: Ceph, **kwargs) -> int:
                         LOG.info(f"Started scaling up {scaleup_nodes}")
 
                         # Prepare FIO execution for existing namespaces
-                        old_namespaces = ha.fetch_namespaces(ha.gateways[0])
+                        old_namespaces = fetch_namespaces(ha.gateways[0])
                         ha.prepare_io_execution(initiators)
 
                         # Start IO Execution into already existing namespaces/nodes
@@ -597,7 +598,7 @@ def run(ceph_cluster: Ceph, **kwargs) -> int:
 
                             # Prepare FIO Execution for new namespaces
                             ha.prepare_io_execution(initiators)
-                            new_namespaces = ha.fetch_namespaces(ha.gateways[-1])
+                            new_namespaces = fetch_namespaces(ha.gateways[-1])
 
                             # Check for targets at clients for new namespaces
                             ha.compare_client_namespace(

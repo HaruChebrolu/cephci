@@ -20,6 +20,7 @@ from tests.nvmeof.test_ceph_nvmeof_high_availability import (
 )
 from tests.nvmeof.workflows.ha import HighAvailability
 from tests.nvmeof.workflows.nvme_utils import deploy_nvme_service
+from tests.nvmeof.workflows.utils import fetch_namespaces
 from tests.rbd.rbd_utils import initial_rbd_config
 from utility.log import Log
 
@@ -224,7 +225,7 @@ def run(ceph_cluster: Ceph, **kwargs) -> int:
         pre_upg_versions = fetch_nvme_versions(ha.gateways)
 
         # Prepare and Run FIO on NVMe devices
-        namespaces = ha.fetch_namespaces(nvmegwcli)
+        namespaces = fetch_namespaces(nvmegwcli)
         initiators = config["initiators"]
         ha.prepare_io_execution(initiators)
         ha.compare_client_namespace([i["uuid"] for i in namespaces])
