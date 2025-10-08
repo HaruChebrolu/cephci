@@ -1,0 +1,6 @@
+pandas
+gspread
+gspread_formatting
+docopt
+gspread_dataframe
+google-api-python-client
