@@ -268,6 +268,7 @@ def parse_testcase_timings(xml_file):
         print(f"❌ Error parsing testcases from {xml_file}: {e}")
 
     return testcases_data
+
 def update_gsheet(sheet_name, data, columns_order=None):
     """Write extracted XML properties into Google Sheet."""
     try:
@@ -334,20 +335,19 @@ def update_gsheet(sheet_name, data, columns_order=None):
     except Exception as e:
         print(f"❌ Failed to update Google Sheet '{sheet_name}': {e}")
 
-
 def update_dynamic_gsheet(sheet_name, data, ceph_version_arg, value_type="Time"):
     """
-    Update Google Sheet with dynamic columns per CEPh version.
+    Update Google Sheet with dynamic columns per Ceph version.
     - value_type: "Time" or "Status"
     - Adds a new column like 'Time (seconds)(19.2.0-190)' or 'Status (19.2.0-190)'
     - Preserves existing data and updates existing rows.
+    - Optimized: batch updates to avoid Google Sheets API quota limits.
     """
-    # Define formats for different statuses
     client = get_gsheet_client(SERVICE_ACCOUNT_FILE)
     spreadsheet = client.open_by_key(gsheet_id)
     ws = get_or_create_worksheet(spreadsheet, sheet_name)
 
-    # Get current sheet data
+    # --- Fetch existing sheet data ---
     all_values = ws.get_all_values()
     if all_values:
         header = all_values[0]
@@ -356,93 +356,94 @@ def update_dynamic_gsheet(sheet_name, data, ceph_version_arg, value_type="Time")
         header = ["Test Suite Name", "Test Case Name", "Component"]
         existing_rows = []
 
-    # Remove source_file if exists
+    # Remove "source_file" column if exists
     if "source_file" in header:
         header.remove("source_file")
 
-    # Determine dynamic column
-    col_name = f"{value_type} ({ceph_version_arg})"
+    # --- Determine column names and data keys ---
+    if value_type == "Time":
+        data_key = "Time (seconds)"
+        col_name = f"Time (seconds) ({ceph_version_arg})"
+    else:
+        data_key = "Status"
+        col_name = f"Status ({ceph_version_arg})"
+
     if col_name not in header:
         header.append(col_name)
 
-    # Update header in sheet
-    ws.update(range_name="A1", values=[header])
-
-    # Freeze header & bold
+    # --- Update header ---
+    ws.update("A1", [header])
     set_frozen(ws, 1)
     fmt = cellFormat(textFormat=textFormat(bold=True))
     format_cell_range(ws, f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}", fmt)
 
-    # Map existing rows
+    # --- Map existing rows ---
     idx_suite = header.index("Test Suite Name")
     idx_case = header.index("Test Case Name")
-    row_map = {}
-    for i, row in enumerate(existing_rows):
+    sheet_row_map = {}  # key -> existing row
+    for row in existing_rows:
         key = (row[idx_suite], row[idx_case])
-        row_map[key] = row
+        sheet_row_map[key] = row
 
-    # Build updated rows
-    updated_rows = []
+    # --- Merge existing rows and prepare new rows ---
+    updated_rows_dict = {}
     new_rows = []
 
     for entry in data:
         key = (entry["Test Suite Name"], entry["Test Case Name"])
+        # Build row aligned to header
         row = []
-        for h_idx, h in enumerate(header):
+        for h in header:
             if h == col_name:
-                value = entry.get(value_type if value_type == "Time" else "Status", "")
+                row.append(entry.get(data_key, ""))
             elif h in entry:
-                value = entry[h]
+                row.append(entry[h])
             else:
-                value = ""
-            row.append(value)
+                row.append("")
 
-        if key in row_map:
-            # Merge with existing row safely
-            existing_row = row_map[key]
-            merged_row = []
-            for h_idx, h in enumerate(header):
-                existing_val = existing_row[h_idx] if h_idx < len(existing_row) else ""
-                merged_row.append(row[h_idx] if row[h_idx] != "" else existing_val)
-            updated_rows.append((key, merged_row))
+        if key in sheet_row_map:
+            # Merge existing row with new values
+            existing_row = sheet_row_map[key]
+            merged_row = [
+                row[i] if row[i] != "" else (existing_row[i] if i < len(existing_row) else "")
+                for i in range(len(header))
+            ]
+            updated_rows_dict[key] = merged_row
         else:
             new_rows.append(row)
 
-    # Batch update existing rows
-    for i, (key, merged_row) in enumerate(updated_rows):
-        row_idx = i + 2  # 1-indexed + header
-        ws.update(range_name=f"A{row_idx}", values=[merged_row])
-
+    # --- Prepare final data for batch update ---
+    final_rows = []
+    # Existing rows (updated)
+    for key, row in sheet_row_map.items():
+        if key in updated_rows_dict:
+            final_rows.append(updated_rows_dict[key])
+        else:
+            final_rows.append(row)
     # Append new rows
-    if new_rows:
-        ws.append_rows(new_rows)
+    final_rows.extend(new_rows)
 
-    # --- Conditional formatting for Status column ---
+    # --- Batch update all rows at once ---
+    if final_rows:
+        ws.update(f"A2:{gspread.utils.rowcol_to_a1(len(final_rows)+1, len(header))}", final_rows)
+
+    # --- Conditional formatting for Status ---
     if value_type == "Status":
         status_col_index = header.index(col_name)
-        # Apply green for "Passed", red for others
-        fmt_passed = cellFormat(backgroundColor=color(0.85, 0.92, 0.83)) # green
-        fmt_failed = cellFormat(backgroundColor=color(0.96, 0.8, 0.8))  # red
-
+        fmt_passed = cellFormat(backgroundColor=color(0.85, 0.92, 0.83))
+        fmt_failed = cellFormat(backgroundColor=color(0.96, 0.8, 0.8))
         start_row = 2
-        end_row = len(existing_rows) + len(new_rows) + 1
-        if end_row >= start_row:
-            # Green for Passed
-            format_cell_range(
-                ws,
-                f"{gspread.utils.rowcol_to_a1(start_row, status_col_index+1)}:"
-                f"{gspread.utils.rowcol_to_a1(end_row, status_col_index+1)}",
-                cellFormat(backgroundColor=color(0.85, 0.92, 0.83))
-            )
-            for r_idx, row in enumerate(existing_rows + new_rows, start=start_row):
-                cell_val = row[status_col_index]
-                fmt = fmt_passed if cell_val == "Passed" else fmt_failed
-                format_cell_range(ws,
-                    f"{gspread.utils.rowcol_to_a1(r_idx, status_col_index+1)}",
-                    fmt
-                )
+        end_row = len(final_rows) + 1
+
+        # Apply formatting row by row efficiently
+        for r_idx, row in enumerate(final_rows, start=start_row):
+            cell_val = row[status_col_index]
+            fmt = fmt_passed if cell_val == "Passed" else fmt_failed
+            format_cell_range(ws, f"{gspread.utils.rowcol_to_a1(r_idx, status_col_index+1)}", fmt)
 
     print(f"✅ Google Sheet '{sheet_name}' updated successfully for {value_type} columns.")
+
+
 
 
 if __name__ == "__main__":
@@ -513,7 +514,7 @@ if __name__ == "__main__":
                    ]
         update_gsheet(SHEET_SUMMARY, all_stats, columns_order=columns)
         update_dynamic_gsheet(SHEET_TEST_STATUS, all_testcases, ceph_version_arg, value_type="Status")
-        update_dynamic_gsheet(SHEET_TEST_TIMINGS, all_testcase_execution_times, ceph_version_arg, value_type="Time (seconds)")
+        update_dynamic_gsheet(SHEET_TEST_TIMINGS, all_testcase_execution_times, ceph_version_arg)
 
     else:
         print("Error: Failed to process XML file, GSheet not updated.")
